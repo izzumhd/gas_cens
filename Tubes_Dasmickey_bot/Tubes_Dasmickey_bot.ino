@@ -1,70 +1,105 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
 #include <esp_sleep.h>
 
 #define MQ135_PIN 1
 #define BUZZER_PIN 3
 
-// ---------- Isi sesuai WiFi kamu ----------
 const char* ssid = "Udaradingin";
 const char* password = "woiwoiwoi";
 
-// ---------- Telegram Bot ----------
-String BOT_TOKEN = "8583077078:AAG3JtRBUt7Zy4AKJqqHurIHQg7mJGCzkBM";
-String CHAT_ID = "7239861208";
+#define BOT_TOKEN "8583077078:AAG3JtRBUt7Zy4AKJqqHurIHQg7mJGCzkBM"
+#define CHAT_ID "7239861208"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
 int thresholdMedium = 2000;
 int thresholdHigh = 3000;
 
-WiFiClientSecure client;
+int beepShort = 150;
+int beepLong = 300;
+int beepGap = 80;
 
-void sendTelegram(String pesan) {
-  if (!client.connect("api.telegram.org", 443)) return;
+// ================= TIMER =================
+unsigned long lastAlert = 0;
+unsigned long lastBotCheck = 0;
 
-  String url = "/bot" + BOT_TOKEN + "/sendMessage?chat_id=" + CHAT_ID + "&text=" + pesan;
+// ================= STATUS =================
+String gasStatus = "NORMAL";
+int lastADC = 0;
 
-  client.println("GET " + url + " HTTP/1.1");
-  client.println("Host: api.telegram.org");
-  client.println("Connection: close");
-  client.println();
+// med
+void klaksonMedium() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(beepShort);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(400);
+  }
 }
 
-void klakson(int dur, int jeda) {
+// hi
+void klaksonSOS() {
   for (int i = 0; i < 3; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(dur);
+    delay(beepShort);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(jeda);
+    delay(beepGap);
   }
+
   delay(200);
   for (int i = 0; i < 3; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(dur * 2);
+    delay(beepLong);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(jeda);
+    delay(beepGap);
   }
+
   delay(200);
   for (int i = 0; i < 3; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(dur);
+    delay(beepShort);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(jeda);
+    delay(beepGap);
   }
-  delay(1000);
+  delay(200);
 }
 
+//  turu
 void enterLightSleep() {
-  Serial.println("→ Light sleep aktif...");
-
-  // WiFi sleep (hemat banyak energi)
   WiFi.setSleep(true);
-
-  // Masuk mode sleep sekitar 200ms (cukup untuk hemat, ADC tetap hidup)
-  esp_sleep_enable_timer_wakeup(200000);
+  esp_sleep_enable_timer_wakeup(300000);  // 300 ms
   esp_light_sleep_start();
-
-  // Setelah bangun, WiFi masih OFF, ADC masih ON
   WiFi.setSleep(false);
+}
+
+String buildStatusMessage() {
+  String msg = "Status Gas Saat Ini\n";
+  msg += "ADC: " + String(lastADC) + "\n";
+  msg += "Kondisi: " + gasStatus;
+  return msg;
+}
+
+void handleTelegram() {
+  int newMsg = bot.getUpdates(bot.last_message_received + 1);
+
+  while (newMsg) {
+    for (int i = 0; i < newMsg; i++) {
+      String text = bot.messages[i].text;
+      String chat_id = bot.messages[i].chat_id;
+
+      if (chat_id != CHAT_ID) continue;
+
+      if (text == "/status") {
+        bot.sendMessage(chat_id, buildStatusMessage(), "");
+      } else {
+        bot.sendMessage(chat_id, "Command tidak dikenali.\nGunakan /status", "");
+      }
+    }
+    newMsg = bot.getUpdates(bot.last_message_received + 1);
+  }
 }
 
 void setup() {
@@ -75,43 +110,48 @@ void setup() {
 
   analogReadResolution(12);
 
-  WiFi.begin(ssid, pass);
+  WiFi.begin(ssid, password);
   client.setInsecure();
 
   while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
     Serial.print(".");
-    delay(100);
   }
+  Serial.println("\nWiFi Connected");
 
-  Serial.println("\nWiFi Connected!");
+  bot.sendMessage(CHAT_ID, "ESP32 aktif dan siap menerima perintah.", "");
 }
 
 void loop() {
-  int adcValue = analogRead(MQ135_PIN);
+  lastADC = analogRead(MQ135_PIN);
+  Serial.print("Nilai gas: ");
+  Serial.print(lastADC);
+  Serial.print("  |  Status: ");
+  Serial.println(gasStatus);
 
-  Serial.print("Gas ADC: ");
-  Serial.println(adcValue);
-
-  // ===== NORMAL =====
-  if (adcValue < thresholdMedium) {
-    digitalWrite(BUZZER_PIN, LOW);
-    enterLightSleep();  // hemat daya
-    return;
+  if (lastADC < thresholdMedium) {
+    gasStatus = "NORMAL";
+  } else if (lastADC < thresholdHigh) {
+    gasStatus = "MENENGAH";
+  } else {
+    gasStatus = "TINGGI";
   }
 
-  // ===== MEDIUM =====
-  if (adcValue >= thresholdMedium && adcValue < thresholdHigh) {
-    sendTelegram("⚠️ GAS MENENGAH TERDETEKSI\nADC: " + String(adcValue));
-    klakson(200, 600)
-      delay(3000);
-    return;
+  if (gasStatus == "MENENGAH" && millis() - lastAlert > 5000) {
+    bot.sendMessage(CHAT_ID, buildStatusMessage(), "");
+    klaksonMedium();
+    lastAlert = millis();
   }
-
-  // ===== HIGH =====
-  if (adcValue >= thresholdHigh) {
-    sendTelegram("🚨 GAS TINGGI! BAHAYA!\nADC: " + String(adcValue));
-    klakson(200, 300);  // 1 kali pattern
-    delay(3000);
-    return;
+  if (gasStatus == "TINGGI" && millis() - lastAlert > 3000) {
+    bot.sendMessage(CHAT_ID, buildStatusMessage(), "");
+    klaksonSOS();
+    lastAlert = millis();
+  }
+  if (millis() - lastBotCheck > 1000) {
+    handleTelegram();
+    lastBotCheck = millis();
+  }
+  if (gasStatus == "NORMAL") {
+    delay(200);
   }
 }
